@@ -287,19 +287,47 @@ uvmfree(pagetable_t pagetable, uint64 sz)
   freewalk(pagetable);
 }
 
+// COW需要同时更新kpagetable用户镜像
+int
+kvmremap_user_range(pagetable_t kpagetable, uint64 va, uint64 pa, uint64 flags)
+{
+  pte_t *kpte;
+  va = PGROUNDDOWN(va);
+  flags &= ~PTE_U;
+
+  kpte = walk(kpagetable, va, 0);
+  if(kpte && (*kpte & PTE_V)){
+    if((*kpte & (PTE_R|PTE_W|PTE_X)) == 0)
+      panic("kvmremap_user_range: non-leaf");
+
+    if(kvm_page_matches(kpagetable, va, pa, flags))
+      return 0;
+
+    *kpte = 0;
+  }
+
+  return mappages(kpagetable, va, PGSIZE, pa, flags);
+}
+
 // Given a parent process's page table, copy
 // its memory into a child's page table.
 // Copies both the page table and the
 // physical memory.
 // returns 0 on success, -1 on failure.
 // frees any allocated pages on failure.
+
+// change to COW version
+// the parent and child share the sanme physical page
+// if the PTE_W = 1 , erase it and put on PTE_COW
+// ref_cnt++
+
 int
 uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
 {
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
+  // char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
@@ -308,14 +336,25 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       continue;   // physical page hasn't been allocated
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+    // if((mem = kalloc()) == 0)
+      // goto err;
+    // memmove(mem, (char*)pa, PGSIZE);
+    if(flags&PTE_W){
+      flags=(flags&~PTE_W)|PTE_COW;
+      *pte=PA2PTE(pa)|flags|PTE_V;
+
+      if(kvmremap_user_range(myproc()->kpagetable, i, pa, flags) != 0)
+        goto err;
+    }
+    if(mappages(new, i, PGSIZE, pa, flags) != 0){
+      // 直接将父进程页表中的所有页表项全部直接映射到子进程页表中
+      // 而不是新的一段 mem
+      // kfree(mem);
       goto err;
     }
+    kaddref(pa);
   }
+  sfence_vma();
   return 0;
 
  err:
@@ -329,16 +368,26 @@ void
 uvmclear(pagetable_t pagetable, uint64 va)
 {
   pte_t *pte;
-  
+  struct proc *p = myproc();
+
   pte = walk(pagetable, va, 0);
   if(pte == 0)
     panic("uvmclear");
+
   *pte &= ~PTE_U;
+
+  if(kvmremap_user_range(p->kpagetable, va, PTE2PA(*pte), PTE_FLAGS(*pte)) != 0)
+    panic("uvmclear: kpagetable sync");
+
+  sfence_vma();
 }
 
 // Copy from kernel to user.
 // Copy len bytes from src to virtual address dstva in a given page table.
 // Return 0 on success, -1 on error.
+// COW version
+// 额外处理处理“这页已经映射了，只是因为 COW 暂时不可写”的情况
+
 int
 copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 {
@@ -349,22 +398,52 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     va0 = PGROUNDDOWN(dstva);
     if(va0 >= MAXVA)
       return -1;
-  
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0) {
-      if((pa0 = vmfault(pagetable, va0, 0)) == 0) {
-        return -1;
-      }
-    }
 
     pte = walk(pagetable, va0, 0);
-    // forbid copyout over read-only user text pages.
+
+    if(pte == 0 || (*pte & PTE_V) == 0){
+      pa0 = vmfault(pagetable, va0, 0);
+      if(pa0 == 0)
+        return -1;
+      pte = walk(pagetable, va0, 0);
+      if(pte == 0 || (*pte & PTE_V) == 0)
+        return -1;
+    }
+
+    // 必须是用户页
+    /*
+    DEBUG:
+    这里我们只来判断了当前的pte是否合法，是否可写
+    但是我们根本就没判断当前它是否是用户态
+    导致了对于测试样例中的地址0x3fffffe000
+    它恰好在是可写的，但是PTE_U=0，不是用户页
+    那如果我们下面不加入这个判断的话就会导致我们直接把它当成了可写页
+    好家伙直接给哥们的tf->epc写飞了
+    */
+    if((*pte & PTE_U) == 0)
+      return -1;
+
+    // 必须是叶子
+    if((*pte & (PTE_R|PTE_W|PTE_X)) == 0)
+      return -1;
+
+    if((*pte & PTE_COW) != 0){
+      if(cowalloc(pagetable, va0) < 0)
+        return -1;
+      pte = walk(pagetable, va0, 0);
+      if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0)
+        return -1;
+    }
+
     if((*pte & PTE_W) == 0)
       return -1;
-      
+
+    pa0 = PTE2PA(*pte);
+
     n = PGSIZE - (dstva - va0);
     if(n > len)
       n = len;
+
     memmove((void *)(pa0 + (dstva - va0)), src, n);
 
     len -= n;
@@ -384,15 +463,22 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 
   while(len > 0){
     va0 = PGROUNDDOWN(srcva);
+    if(va0 >= MAXVA)
+      return -1;
+
     pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0) {
-      if((pa0 = vmfault(pagetable, va0, 0)) == 0) {
+    if(pa0 == 0){
+      if(vmfault(pagetable, va0, 1) == 0)
         return -1;
-      }
+      pa0 = walkaddr(pagetable, va0);
+      if(pa0 == 0)
+        return -1;
     }
+
     n = PGSIZE - (srcva - va0);
     if(n > len)
       n = len;
+
     memmove(dst, (void *)(pa0 + (srcva - va0)), n);
 
     len -= n;
@@ -414,22 +500,30 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 
   while(got_null == 0 && max > 0){
     va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
+    if(va0 >= MAXVA)
       return -1;
+
+    pa0 = walkaddr(pagetable, va0);
+    if(pa0 == 0){
+      if(vmfault(pagetable, va0, 1) == 0)
+        return -1;
+      pa0 = walkaddr(pagetable, va0);
+      if(pa0 == 0)
+        return -1;
+    }
+
     n = PGSIZE - (srcva - va0);
     if(n > max)
       n = max;
 
-    char *p = (char *) (pa0 + (srcva - va0));
+    char *p = (char *)(pa0 + (srcva - va0));
     while(n > 0){
       if(*p == '\0'){
         *dst = '\0';
         got_null = 1;
         break;
-      } else {
-        *dst = *p;
       }
+      *dst = *p;
       --n;
       --max;
       p++;
@@ -438,49 +532,386 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 
     srcva = va0 + PGSIZE;
   }
-  if(got_null){
-    return 0;
-  } else {
-    return -1;
-  }
+
+  return got_null ? 0 : -1;
 }
 
 // allocate and map user memory if process is referencing a page
 // that was lazily allocated in sys_sbrk().
 // returns 0 if va is invalid or already mapped, or if
 // out of physical memory, and physical address if successful.
+
+// 针对系统调用sbrk，我们只是在逻辑空间上将用户可访问空间增大，
+// 但是在物理页面上我们并没有做分配
+// lazy allocation
 uint64
 vmfault(pagetable_t pagetable, uint64 va, int read)
 {
-  uint64 mem;
   struct proc *p = myproc();
+  uint64 mem;
+  uint64 stackbase;
+  pte_t *pte;
 
-  if (va >= p->sz)
-    return 0;
+  uint64 faultva=va;
   va = PGROUNDDOWN(va);
-  if(ismapped(pagetable, va)) {
+
+  // user VA must stay below PLIC in this design
+  if(faultva >= p->sz || faultva >= PLIC)
+    return 0;
+
+  // reject only the single guard page below user stack
+  stackbase = PGROUNDDOWN(p->trapframe->sp);
+  if(stackbase >= PGSIZE && faultva >= stackbase - PGSIZE && faultva < stackbase)
+    return 0;
+
+  // already mapped in user pagetable
+  // 注意这里其实还是需要做kpagetable和pagetable的同步
+  // 不能直接返回
+  pte = walk(p->pagetable, va, 0);
+  if(pte && (*pte & PTE_V)){
+    // uint64 pa=PTE2PA(*pte);
+    // uint64 flags=PTE_FLAGS(*pte);
+
+    // if((*pte & (PTE_R | PTE_W | PTE_X)) == 0)
+    //   panic("vmfault: user non-leaf");
+
+    // if(kvmremap_user_range(p->kpagetable,va,pa,flags)!=0){
+    //   panic("vmfault: repair kpagetable mirror");
+    // }
+    // sfence_vma();
+    // return pa;
     return 0;
   }
-  mem = (uint64) kalloc();
+
+  mem = (uint64)kalloc();
   if(mem == 0)
     return 0;
-  memset((void *) mem, 0, PGSIZE);
-  if (mappages(p->pagetable, va, PGSIZE, mem, PTE_W|PTE_U|PTE_R) != 0) {
-    kfree((void *)mem);
+  memset((void*)mem, 0, PGSIZE);
+
+  if(mappages(p->pagetable, va, PGSIZE, mem, PTE_R | PTE_W | PTE_U) != 0){
+    kfree((void*)mem);
     return 0;
   }
+
+  if(mappages(p->kpagetable, va, PGSIZE, mem, PTE_R | PTE_W) != 0){
+    uvmunmap(p->pagetable, va, 1, 1);
+    return 0;
+  }
+
+  sfence_vma();
   return mem;
 }
 
-int
-ismapped(pagetable_t pagetable, uint64 va)
+void vmprintf_walk(pagetable_t pagetable,int level){
+  for(int i=0;i<512;i++){
+    pte_t pte=pagetable[i];
+    if(pte&PTE_V){
+      for(int j=0;j<level;j++){
+        printf("..");
+      }
+      uint64 pa=PTE2PA(pte);
+      printf("%d: pte %ld pa %ld\n", i, (uint64)pte, pa);
+      // non leaf pte
+      if((pte&(PTE_R|PTE_W|PTE_X))==0){
+        vmprintf_walk((pagetable_t)pa,level+1);
+      }
+    }
+  }
+}
+
+void vmprintf(pagetable_t pagetable){
+  printf("page table %p\n",pagetable);
+  vmprintf_walk(pagetable,1);
+}
+
+pagetable_t
+proc_kpagetable(void)
 {
-  pte_t *pte = walk(pagetable, va, 0);
-  if (pte == 0) {
+  pagetable_t kpagetable;
+
+  kpagetable = (pagetable_t) kalloc();
+  if(kpagetable == 0)
     return 0;
+  memset(kpagetable, 0, PGSIZE);
+
+  // device registers
+  kvmmap(kpagetable, UART0, UART0, PGSIZE, PTE_R | PTE_W);
+  kvmmap(kpagetable, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
+  kvmmap(kpagetable, PLIC, PLIC, 0x4000000, PTE_R | PTE_W);
+
+  // kernel text: executable and read-only
+  kvmmap(kpagetable, KERNBASE, KERNBASE, (uint64)etext - KERNBASE, PTE_R | PTE_X);
+
+  // kernel data and physical RAM
+  kvmmap(kpagetable, (uint64)etext, (uint64)etext,
+         PHYSTOP - (uint64)etext, PTE_R | PTE_W);
+
+  // trampoline
+  kvmmap(kpagetable, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+
+  return kpagetable;
+}
+
+void
+free_kpagetable_walk(pagetable_t pagetable)
+{
+  for(int i = 0; i < 512; i++){
+    pte_t pte = pagetable[i];
+    if(pte & PTE_V){
+      if((pte & (PTE_R|PTE_W|PTE_X)) == 0){
+        pagetable_t child = (pagetable_t)PTE2PA(pte);
+        free_kpagetable_walk(child);
+        pagetable[i] = 0;
+        kfree((void*)child);
+      } else {
+        pagetable[i] = 0;
+      }
+    }
   }
-  if (*pte & PTE_V){
-    return 1;
+}
+
+void
+proc_free_kpagetable(pagetable_t kpagetable)
+{
+  if(kpagetable == 0)
+    return;
+  free_kpagetable_walk(kpagetable);
+  kfree((void*)kpagetable);
+}
+
+void
+ukvmunmap(pagetable_t pagetable, uint64 va, uint64 npages)
+{
+  uint64 a;
+  pte_t *pte;
+
+  if((va % PGSIZE) != 0)
+    panic("ukvmunmap: not aligned");
+
+  for(a = va; a < va + npages * PGSIZE; a += PGSIZE){
+    pte = walk(pagetable, a, 0);
+    if(pte == 0)
+      continue;
+    if((*pte & PTE_V) == 0)
+      continue;
+    if(PTE_FLAGS(*pte) == PTE_V)
+      panic("ukvmunmap: not a leaf");
+    *pte = 0;
   }
+}
+
+int
+kvmmap_user(pagetable_t kpgtbl, pagetable_t upgtbl, uint64 sz)
+{
+  uint64 va;
+
+  for(va = 0; va < sz; va += PGSIZE){
+    pte_t *pte = walk(upgtbl, va, 0);
+
+    if(pte == 0)
+      continue;
+    if((*pte & PTE_V) == 0)
+      continue;
+    if((*pte & (PTE_R | PTE_W | PTE_X)) == 0)
+      panic("kvmmap_user: user non-leaf");
+
+    uint64 pa = PTE2PA(*pte);
+    uint64 flags = PTE_FLAGS(*pte) & ~PTE_U;
+
+    pte_t *kpte = walk(kpgtbl, va, 0);
+    if(kpte && (*kpte & PTE_V)){
+      if(kvm_page_matches(kpgtbl, va, pa, flags))
+        continue;
+      return -1;
+    }
+
+    if(mappages(kpgtbl, va, PGSIZE, pa, flags) != 0)
+      return -1;
+  }
+
   return 0;
 }
+
+void
+kvmunmap_user_range(pagetable_t kpgtbl, uint64 oldsz, uint64 newsz)
+{
+  if(newsz >= oldsz)
+    return;
+
+  uint64 a = PGROUNDUP(newsz);
+  uint64 last = PGROUNDUP(oldsz);
+  for(; a < last; a += PGSIZE)
+    ukvmunmap(kpgtbl, a, 1);
+}
+
+int
+kvmmap_user_range(pagetable_t kpgtbl, pagetable_t upgtbl, uint64 oldsz, uint64 newsz)
+{
+  uint64 a;
+
+  a = PGROUNDUP(oldsz);
+  for(; a < newsz; a += PGSIZE){
+    pte_t *pte = walk(upgtbl, a, 0);
+
+    // lazy allocation hole: skip it
+    if(pte == 0)
+      continue;
+    if((*pte & PTE_V) == 0)
+      continue;
+
+    if((*pte & (PTE_R | PTE_W | PTE_X)) == 0)
+      panic("kvmmap_user_range: user non-leaf");
+
+    uint64 pa = PTE2PA(*pte);
+    uint64 flags = PTE_FLAGS(*pte) & ~PTE_U;
+
+    pte_t *kpte = walk(kpgtbl, a, 0);
+    if(kpte && (*kpte & PTE_V)){
+      if(kvm_page_matches(kpgtbl, a, pa, flags))
+        continue;
+      return -1;
+    }
+
+    if(mappages(kpgtbl, a, PGSIZE, pa, flags) != 0)
+      return -1;
+  }
+
+  return 0;
+}
+
+int
+kvm_page_matches(pagetable_t kpgtbl, uint64 va, uint64 pa, uint64 flags)
+{
+  pte_t *kpte = walk(kpgtbl, va, 0);
+  if(kpte == 0)
+    return 0;
+  if((*kpte & PTE_V) == 0)
+    return 0;
+  if((*kpte & (PTE_R|PTE_W|PTE_X)) == 0)
+    return 0;   // non-leaf, unexpected here
+
+  uint64 kpa = PTE2PA(*kpte);
+  uint64 kflags = PTE_FLAGS(*kpte);
+
+  // kpagetable 里的用户镜像本来就会去掉 PTE_U
+  flags &= ~PTE_U;
+  kflags &= ~PTE_U;
+
+  return (kpa == pa) && (kflags == flags);
+}
+
+// lab5
+// 怎么还是改vm ???
+// 都写700多行了qwq
+
+int cowpage(pagetable_t pagetable,uint64 va){
+  pte_t* pte;
+  va=PGROUNDDOWN(va);
+  if(va>=MAXVA){
+    return 0;
+  }
+  pte=walk(pagetable,va,0);
+  if(pte==0){
+    return 0;
+  }
+  if(((*pte&PTE_V)==0)||((*pte&PTE_U)==0)||((*pte&PTE_COW)==0)){
+    return 0;
+  }
+  return 1;
+}
+
+/*
+系统发生写异常
+找到 fault 页 PTE
+必须是有效用户 COW 页
+如果 refcount == 1，其实不用复制，只要把当前页恢复成可写并清掉 PTE_COW
+如果 refcount > 1，就新分配一页，拷贝内容，旧页 kfree()，新页替换映射
+别忘了同步更新 kpagetable
+*/
+int cowalloc(pagetable_t pagetable,uint64 va){
+  pte_t* pte;
+  uint64 pa;
+  uint oldflags,newflags;
+  char* mem;
+  struct proc* p=myproc();
+
+  va=PGROUNDDOWN(va);
+  if(va>=p->sz||va>=TRAPFRAME){
+    return -1;
+  }
+
+  pte=walk(pagetable,va,0);
+  if(pte == 0)
+    return -1;
+  if((*pte & PTE_V) == 0)
+    return -1;
+  if((*pte & PTE_U) == 0)
+    return -1;
+  if((*pte & PTE_COW) == 0)
+    return -1;
+  
+  pa=PTE2PA(*pte);
+  oldflags=PTE_FLAGS(*pte);
+  newflags=(oldflags|PTE_W)&~PTE_COW; // 可写，非cow页
+  if(kgetref(pa)==1){
+    *pte=PA2PTE(pa)|newflags|PTE_V;
+    // 更新进程内核页表
+    if(kvmremap_user_range(p->kpagetable,va,pa,newflags)!=0){
+      return -1;
+    }
+    sfence_vma();
+    return 0;
+  }
+
+  mem=kalloc();
+  if(mem==0){
+    return -1;
+  }
+
+  memmove(mem,(char*)pa,PGSIZE);  // pa copy to mem
+
+  uvmunmap(pagetable,va,1,0); // 只删除物理映射，不放弃物理页
+
+  // 建立新的映射
+  // va -> mem
+  if(mappages(pagetable,va,PGSIZE,(uint64)mem,newflags)!=0){
+    kfree(mem);
+    // alloc fail , roll back to the va -> pa
+    if(mappages(pagetable,va,PGSIZE,pa,oldflags)!=0){
+      panic("cowalloc restore user mappages");
+    }
+    return -1;
+  }
+
+  // if(kvmremap_user_range(p->kpagetable,va,(uint64)mem,newflags)!=0){
+  //   uvmunmap(pagetable,va,1,0); // 将刚刚建立的用户也变的映射关系也删除，保证内核页表和用户页表映射的一致性
+  //   if(mappages(p->kpagetable,va,PGSIZE,pa,oldflags)!=0){
+  //     panic("cowalloc restore k_user mappages");
+  //   }
+  //   kfree(mem);
+  //   return -1;
+  // }
+
+  if(kvmremap_user_range(p->kpagetable, va, (uint64)mem, newflags) != 0){
+    uvmunmap(pagetable, va, 1, 0);
+
+    // 先恢复用户页表
+    if(mappages(pagetable, va, PGSIZE, pa, oldflags) != 0){
+      panic("cowalloc restore user mappages 2");
+    }
+
+    // 再恢复内核镜像页表
+    if(kvmremap_user_range(p->kpagetable, va, pa, oldflags) != 0){
+      panic("cowalloc restore kpagetable");
+    }
+
+    kfree(mem);
+    return -1;
+  }
+
+  kfree((void*)pa); // 注意这里我们已经再kalloc.c里面把这个函数修改了，这里只是将ref[pa]-=1
+  sfence_vma();
+  return 0;
+}
+
+

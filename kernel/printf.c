@@ -149,3 +149,39 @@ printfinit(void)
 {
   initlock(&pr.lock, "pr");
 }
+
+// lab 4
+/*
+下面是编译原理环节
+
+高地址
++------------------+
+| 上一层函数栈帧     |
++------------------+
+| 返回地址 ra       |  <- fp - 8
+| 上一个 frame ptr |  <- fp - 16
+| 局部变量 ...      |
++------------------+  <- 当前 sp
+低地址
+
+每一个栈就一个PGSIZE的大小
+追溯不超过当前栈所在的页面
+*/
+void backtrace(void){
+  printf("Start back trace!\n");
+  uint64 fp=r_fp();
+  uint64 bottom=PGROUNDDOWN(fp);
+  uint64 top=bottom+PGSIZE;
+
+  while(fp>=bottom&&fp<top){
+    uint64 ra=*(uint64 *)(fp-8);
+    uint64 prev_fp=*(uint64 *)(fp-16);
+    printf("%p\n",(void *)ra);
+    fp=prev_fp;
+  }
+}
+/*
+可以使用
+riscv64-unknown-elf-addr2line -f -e kernel/kernel [地址]
+去离线查找对应的函数调用者
+*/

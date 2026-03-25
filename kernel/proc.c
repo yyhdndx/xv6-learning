@@ -38,6 +38,7 @@ proc_mapstacks(pagetable_t kpgtbl)
     char *pa = kalloc();
     if(pa == 0)
       panic("kalloc");
+    p->kstack_pa=(uint64)pa;
     uint64 va = KSTACK((int) (p - proc));
     kvmmap(kpgtbl, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
   }
@@ -56,6 +57,7 @@ procinit(void)
       p->state = UNUSED;
       p->kstack = KSTACK((int) (p - proc));
   }
+  kvminithart();
 }
 
 // Must be called with interrupts disabled,
@@ -140,11 +142,42 @@ found:
     return 0;
   }
 
+  // alloc a kstack for each user proc
+  p->kpagetable=proc_kpagetable();
+  if(p->kpagetable==0){
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  // map the kernel stack 2 the kernel page
+  // the kernel stack is init in procinit() func
+  // we only need to do map
+  
+  if(mappages(p->kpagetable, p->kstack, PGSIZE, p->kstack_pa, PTE_R | PTE_W) < 0){
+    proc_free_kpagetable(p->kpagetable);
+    p->kpagetable = 0;
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
+
+  // lab 2
+  p->trace_mask=0;
+
+  // lab 4
+  // alarm init .
+  p->alarm_interval=0;
+  p->alarm_ticks=0;
+  p->alarm_handler=0;
+  p->alarm_active=0;
+  memset(&p->alarm_tf,0,sizeof(p->alarm_tf));
 
   return p;
 }
@@ -160,7 +193,11 @@ freeproc(struct proc *p)
   p->trapframe = 0;
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
+  if(p->kpagetable){
+    proc_free_kpagetable(p->kpagetable);
+  }
   p->pagetable = 0;
+  p->kpagetable=0;
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;
@@ -222,6 +259,8 @@ userinit(void)
   struct proc *p;
 
   p = allocproc();
+  if(kvmmap_user(p->kpagetable, p->pagetable, p->sz) < 0)
+    panic("userinit: kvmmap_user");
   initproc = p;
   
   p->cwd = namei("/");
@@ -236,22 +275,62 @@ userinit(void)
 int
 growproc(int n)
 {
-  uint64 sz;
+  uint64 oldsz, newsz;
   struct proc *p = myproc();
 
-  sz = p->sz;
+  oldsz = p->sz;
+  newsz = oldsz;
+
   if(n > 0){
-    if(sz + n > TRAPFRAME) {
+    // In this design, user virtual memory must stay below PLIC,
+    // because p->kpagetable already maps PLIC and other kernel regions.
+    if(oldsz + n < oldsz)
+      return -1;
+    if(oldsz + n > PLIC)
+      return -1;
+
+    newsz = uvmalloc(p->pagetable, oldsz, oldsz + n, PTE_W);
+    if(newsz == 0)
+      return -1;
+
+    // Mirror only real mapped leaf pages into kpagetable.
+    if(kvmmap_user_range(p->kpagetable, p->pagetable, oldsz, newsz) < 0){
+      kvmunmap_user_range(p->kpagetable, newsz, oldsz);
+      uvmdealloc(p->pagetable, newsz, oldsz);
       return -1;
     }
-    if((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) {
-      return -1;
-    }
+
+    // Current hart may later use this kpagetable; refresh translations.
+    sfence_vma();
+
   } else if(n < 0){
-    sz = uvmdealloc(p->pagetable, sz, sz + n);
+    if(oldsz < (uint64)(-n))
+      return -1;
+
+    newsz = oldsz - (uint64)(-n);
+    newsz = uvmdealloc(p->pagetable, oldsz, newsz);
+
+    if(newsz != oldsz){
+      kvmunmap_user_range(p->kpagetable, oldsz, newsz);
+      sfence_vma();
+    }
   }
-  p->sz = sz;
+
+  p->sz = newsz;
   return 0;
+}
+
+// lab2 count current proc
+uint64 nproc(void){
+  uint64 count_of_proc=0;
+  for(struct proc* p=proc;p<&proc[NPROC];p++){
+    acquire(&p->lock);
+    if(p->state!=UNUSED){
+      ++count_of_proc;
+    }
+    release(&p->lock);
+  }
+  return count_of_proc;
 }
 
 // Create a new process, copying the parent.
@@ -276,6 +355,14 @@ kfork(void)
   }
   np->sz = p->sz;
 
+  // already has alloc the kernel page table 
+  // only has to map to the user kpage table
+  if(kvmmap_user(np->kpagetable,np->pagetable,np->sz)<0){
+    freeproc(np);
+    release(&np->lock);
+    return -1;
+  }
+
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
 
@@ -291,6 +378,9 @@ kfork(void)
   safestrcpy(np->name, p->name, sizeof(p->name));
 
   pid = np->pid;
+
+  // lab 2
+  np->trace_mask=p->trace_mask;
 
   release(&np->lock);
 
@@ -446,7 +536,13 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+
+        w_satp(MAKE_SATP(p->kpagetable));
+        sfence_vma();
         swtch(&c->context, &p->context);
+
+        // switch bace to global kernel page table
+        kvminithart();
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.

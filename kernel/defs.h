@@ -59,6 +59,13 @@ void            ireclaim(int);
 void*           kalloc(void);
 void            kfree(void *);
 void            kinit(void);
+// lab2 count free mem
+uint64          free_mem(void);
+// lab5 copy on write
+void            kaddref(uint64 pa);
+void            ksubref(uint64 pa);
+int             kgetref(uint64 pa);
+
 
 // log.c
 void            initlog(int, struct superblock*);
@@ -76,6 +83,7 @@ int             pipewrite(struct pipe*, uint64, int);
 int             printf(char*, ...) __attribute__ ((format (printf, 1, 2)));
 void            panic(char*) __attribute__((noreturn));
 void            printfinit(void);
+void            backtrace(void);
 
 // proc.c
 int             cpuid(void);
@@ -101,6 +109,8 @@ void            yield(void);
 int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
 int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
 void            procdump(void);
+// lab2 count current proc
+uint64          nproc(void);
 
 // swtch.S
 void            swtch(struct context*, struct context*);
@@ -169,6 +179,18 @@ int             copyin(pagetable_t, char *, uint64, uint64);
 int             copyinstr(pagetable_t, char *, uint64, uint64);
 int             ismapped(pagetable_t, uint64);
 uint64          vmfault(pagetable_t, uint64, int);
+void            vmprintf(pagetable_t);
+void            vmprintf_walk(pagetable_t,int);
+pagetable_t     proc_kpagetable();
+void            ukvmunmap(pagetable_t, uint64, uint64);
+int             kvmmap_user(pagetable_t,pagetable_t,uint64);
+void            proc_free_kpagetable(pagetable_t kpagetable);
+int             kvmmap_user_range(pagetable_t kpgtbl, pagetable_t upgtbl, uint64 oldsz, uint64 newsz);
+void            kvmunmap_user_range(pagetable_t kpgtbl, uint64 oldsz, uint64 newsz);
+int             kvm_page_matches(pagetable_t kpgtbl, uint64 va, uint64 pa, uint64 flags);
+// lab 5 copy on write
+int             cowalloc(pagetable_t pagetable,uint64 va);
+int             cowpage(pagetable_t pagetable,uint64 va);
 
 // plic.c
 void            plicinit(void);

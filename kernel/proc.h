@@ -104,4 +104,24 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+
+  // lab 2
+  int trace_mask;
+  // lab 3
+  pagetable_t kpagetable;
+  uint64 kstack_pa;
+  // lab 4
+  int alarm_interval;         // 每多少 ticks 触发一次
+  int alarm_ticks;            // 已经累计了多少 ticks
+  uint64 alarm_handler;       // handler 的用户地址
+  int alarm_active;           // 当前是否正在执行 handler，防止重入
+  struct trapframe alarm_tf;  // 被打断前保存的一份 trapframe
+
+  // thread 
+  // 这里直接复用proc，不然需要改的地方有点多
+  int is_thread;
+  int t_gid;
+  struct prec* leader;
+  struct proc* t_parent;
+  uint64 ustack;
 };

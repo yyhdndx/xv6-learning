@@ -6,6 +6,7 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "vm.h"
+#include "sysinfo.h"
 
 uint64
 sys_exit(void)
@@ -36,32 +37,73 @@ sys_wait(void)
   return kwait(p);
 }
 
+// uint64
+// sys_sbrk(void)
+// {
+//   int n;
+//   struct proc* p=myproc();
+//   uint64 oldsz,newsz;
+
+//   argint(0,&n);
+//   oldsz = p->sz;
+
+//   // expand
+//   if(n>=0){
+//     if(oldsz+n>=PLIC) return -1;
+//     // lazy allocation : only increase p->sz
+//     p->sz=oldsz+n;
+//     return oldsz;
+//   }
+//   // shink
+//   if(oldsz < (uint64)(-n))
+//     return -1;
+//   newsz=uvmdealloc(p->pagetable,oldsz,oldsz+n);
+//   if(newsz>=oldsz){
+//     return -1;
+//   }
+
+//   kvmunmap_user_range(p->kpagetable,oldsz,newsz);
+//   p->sz=newsz;
+//   sfence_vma();
+
+//   return oldsz;
+// }
+
 uint64
 sys_sbrk(void)
 {
-  uint64 addr;
-  int t;
-  int n;
+  uint64 oldsz;
+  int n, t;
+  struct proc *p = myproc();
 
   argint(0, &n);
   argint(1, &t);
-  addr = myproc()->sz;
+  oldsz = p->sz;
 
-  if(t == SBRK_EAGER || n < 0) {
-    if(growproc(n) < 0) {
-      return -1;
+  // negative sbrk: if it shrinks too much, make it a no-op.
+  if(n < 0){
+    if((uint64)(-n) > oldsz){
+      return oldsz;
     }
-  } else {
-    // Lazily allocate memory for this process: increase its memory
-    // size but don't allocate memory. If the processes uses the
-    // memory, vmfault() will allocate it.
-    if(addr + n < addr)
+    if(growproc(n) < 0)
       return -1;
-    if(addr + n > TRAPFRAME)
-      return -1;
-    myproc()->sz += n;
+    return oldsz;
   }
-  return addr;
+
+  if(t == SBRK_EAGER){
+    if(growproc(n) < 0)
+      return -1;
+    return oldsz;
+  }
+
+  // lazy grow
+  if(oldsz + n < oldsz)
+    return -1;
+  if(oldsz + n > PLIC)
+    return -1;
+
+  p->sz = oldsz + n;
+  return oldsz;
 }
 
 uint64
@@ -82,6 +124,7 @@ sys_pause(void)
     }
     sleep(&ticks, &tickslock);
   }
+  // backtrace();
   release(&tickslock);
   return 0;
 }
@@ -106,4 +149,55 @@ sys_uptime(void)
   xticks = ticks;
   release(&tickslock);
   return xticks;
+}
+
+// Lab2 sys_trace
+// trace the system call
+uint64 sys_trace(void){
+  int mask;
+  argint(0,&mask);
+  if(mask<0){
+    return -1;
+  }
+  myproc()->trace_mask=mask;
+  return 0;
+}
+
+uint64 sys_info(void){
+  uint64 uaddr;
+  argaddr(0,&uaddr);
+  if(uaddr<0){
+    return -1;
+  }
+
+  struct sysinfo ret;
+  ret.free_mem=free_mem();
+  ret.nproc=nproc();
+  if(copyout(myproc()->pagetable,uaddr,(char*)&ret,sizeof(ret))<0){
+    return -1;
+  }
+  return 0;
+}
+
+uint64 sys_sigalarm(void){
+  int ticks=0;
+  uint64 handler;
+  struct proc* p=myproc();
+
+  argint(0,&ticks);
+  argaddr(1,&handler);
+
+  p->alarm_interval=ticks;
+  p->alarm_handler=handler;
+  p->alarm_ticks=0;
+  p->alarm_active=0;
+
+  return 0;
+}
+
+uint64 sys_sigreturn(void){
+  struct proc* p=myproc();
+  memmove(p->trapframe,&p->alarm_tf,sizeof(struct trapframe));  // 将alarm_tf给当前的trapframe
+  p->alarm_active=0;  // 返回，去掉重入标记
+  return 0;
 }

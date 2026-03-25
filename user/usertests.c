@@ -2585,7 +2585,7 @@ badarg(char *s)
   exit(0);
 }
 
-#define REGION_SZ (1024 * 1024 * 1024)
+#define REGION_SZ (1024 * 1024 * 128)
 
 // Touch a page every 64 pages, which with lazy allocation
 // causes one page to be allocated.
@@ -2701,29 +2701,34 @@ lazy_copy(char *s)
 void
 lazy_sbrk(char *s)
 {
-  // sbrk() takes just int, so take 2^30-sized steps towards MAXVA
   char *p = sbrk(0);
-  while ((uint64)p < MAXVA-(1<<30)) {
-    p = sbrklazy(1<<30);
-    if (p < 0) {
-      printf("sbrklazy(%d) returned %p\n", 1<<30, p);
+
+  // grow lazily up to just below PLIC, since this design's
+  // per-process kpagetable already reserves [PLIC, ...) for MMIO/kernel use.
+  while ((uint64)p < PLIC - (1<<26)) {
+    p = sbrklazy(1<<26);   // 64 MiB steps are enough
+    if ((uint64)p == (uint64)-1) {
+      printf("sbrklazy(%d) returned %p\n", 1<<26, p);
       exit(1);
     }
-
     p = sbrklazy(0);
   }
 
-  int n = TRAPFRAME-PGSIZE-(uint64)p;
+  int n = PLIC - PGSIZE - (uint64)p;
+  if (n < 0) {
+    printf("n < 0: p=%p\n", p);
+    exit(1);
+  }
 
   char *p1 = sbrklazy(n);
-  if (p1 < 0 || p1 != p) {
+  if ((uint64)p1 == (uint64)-1 || p1 != p) {
     printf("sbrklazy(%d) returned %p, not expected %p\n", n, p1, p);
     exit(1);
   }
 
   p = sbrk(PGSIZE);
-  if (p < 0 || (uint64)p != TRAPFRAME-PGSIZE) {
-    printf("sbrk(%d) returned %p, not expected TRAPFRAME-PGSIZE\n", PGSIZE, p);
+  if ((uint64)p == (uint64)-1 || (uint64)p != PLIC - PGSIZE) {
+    printf("sbrk(%d) returned %p, not expected PLIC-PGSIZE\n", PGSIZE, p);
     exit(1);
   }
 
@@ -2734,13 +2739,13 @@ lazy_sbrk(char *s)
   }
 
   p = sbrk(1);
-  if ((uint64)p != -1) {
+  if ((uint64)p != (uint64)-1) {
     printf("sbrk(1) returned %p, expected error\n", p);
     exit(1);
   }
 
   p = sbrklazy(1);
-  if ((uint64)p != -1) {
+  if ((uint64)p != (uint64)-1) {
     printf("sbrklazy(1) returned %p, expected error\n", p);
     exit(1);
   }

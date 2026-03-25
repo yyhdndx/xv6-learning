@@ -1,6 +1,7 @@
 #define SBRK_ERROR ((char *)-1)
 
 struct stat;
+struct sysinfo;
 
 // system calls
 int fork(void);
@@ -47,3 +48,20 @@ void printf(const char*, ...) __attribute__ ((format (printf, 1, 2)));
 // umalloc.c
 void* malloc(uint);
 void free(void*);
+
+// lab 2
+int trace(int);
+int info(struct sysinfo*);
+
+// lab 4
+int sigalarm(int ticks, void (*handler)());
+int sigreturn(void);
+
+// uthread
+void thread_schedule(void);
+void thread_stub(void);
+void thread_exit(void);
+int thread_create(void (*func)(void*), void *arg);
+int thread_join(int tid);
+void thread_yield(void);
+int thread_self(void);

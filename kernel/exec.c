@@ -32,7 +32,7 @@ kexec(char *path, char **argv)
   struct elfhdr elf;
   struct inode *ip;
   struct proghdr ph;
-  pagetable_t pagetable = 0, oldpagetable;
+  pagetable_t pagetable = 0, oldpagetable, oldkpagetable;
   struct proc *p = myproc();
 
   begin_op();
@@ -129,13 +129,42 @@ kexec(char *path, char **argv)
     
   // Commit to the user image.
   oldpagetable = p->pagetable;
-  p->pagetable = pagetable;
-  p->sz = sz;
-  p->trapframe->epc = elf.entry;  // initial program counter = ulib.c:start()
-  p->trapframe->sp = sp; // initial stack pointer
-  proc_freepagetable(oldpagetable, oldsz);
+  oldkpagetable = p->kpagetable;
+  oldsz = p->sz;
 
-  return argc; // this ends up in a0, the first argument to main(argc, argv)
+  pagetable_t newkpagetable = proc_kpagetable();
+  if(newkpagetable == 0)
+    goto bad;
+
+  if(mappages(newkpagetable, p->kstack, PGSIZE, p->kstack_pa, PTE_R | PTE_W) < 0){
+    proc_free_kpagetable(newkpagetable);
+    goto bad;
+  }
+
+  if(kvmmap_user(newkpagetable, pagetable, sz) < 0){
+    proc_free_kpagetable(newkpagetable);
+    goto bad;
+  }
+
+  // commit
+  p->pagetable = pagetable;
+  p->kpagetable = newkpagetable;
+  p->sz = sz;
+  p->trapframe->epc = elf.entry;
+  p->trapframe->sp = sp;
+
+  // switch current CPU to new kernel pagetable before freeing old one
+  w_satp(MAKE_SATP(p->kpagetable));
+  sfence_vma();
+
+  proc_freepagetable(oldpagetable, oldsz);
+  proc_free_kpagetable(oldkpagetable);
+
+  // if(p->pid==1){
+    // vmprintf(p->pagetable);
+  // }
+
+  return argc;
 
  bad:
   if(pagetable)
