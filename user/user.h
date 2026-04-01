@@ -65,3 +65,6 @@ int thread_create(void (*func)(void*), void *arg);
 int thread_join(int tid);
 void thread_yield(void);
 int thread_self(void);
+
+// net 
+int e1000test();

@@ -569,18 +569,18 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
   // 不能直接返回
   pte = walk(p->pagetable, va, 0);
   if(pte && (*pte & PTE_V)){
-    // uint64 pa=PTE2PA(*pte);
-    // uint64 flags=PTE_FLAGS(*pte);
+    uint64 pa=PTE2PA(*pte);
+    uint64 flags=PTE_FLAGS(*pte);
 
-    // if((*pte & (PTE_R | PTE_W | PTE_X)) == 0)
-    //   panic("vmfault: user non-leaf");
+    if((*pte & (PTE_R | PTE_W | PTE_X)) == 0)
+      panic("vmfault: user non-leaf");
 
-    // if(kvmremap_user_range(p->kpagetable,va,pa,flags)!=0){
-    //   panic("vmfault: repair kpagetable mirror");
-    // }
-    // sfence_vma();
-    // return pa;
-    return 0;
+    if(kvmremap_user_range(p->kpagetable,va,pa,flags)!=0){
+      panic("vmfault: repair kpagetable mirror");
+    }
+    sfence_vma();
+    return pa;
+    // return 0;
   }
 
   mem = (uint64)kalloc();
@@ -629,28 +629,72 @@ proc_kpagetable(void)
 {
   pagetable_t kpagetable;
 
-  kpagetable = (pagetable_t) kalloc();
+  kpagetable = (pagetable_t)kalloc();
   if(kpagetable == 0)
     return 0;
   memset(kpagetable, 0, PGSIZE);
 
-  // device registers
-  kvmmap(kpagetable, UART0, UART0, PGSIZE, PTE_R | PTE_W);
-  kvmmap(kpagetable, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
-  kvmmap(kpagetable, PLIC, PLIC, 0x4000000, PTE_R | PTE_W);
-
-  // kernel text: executable and read-only
-  kvmmap(kpagetable, KERNBASE, KERNBASE, (uint64)etext - KERNBASE, PTE_R | PTE_X);
-
-  // kernel data and physical RAM
-  kvmmap(kpagetable, (uint64)etext, (uint64)etext,
-         PHYSTOP - (uint64)etext, PTE_R | PTE_W);
-
-  // trampoline
-  kvmmap(kpagetable, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+  if(mappages(kpagetable, UART0, PGSIZE, UART0, PTE_R | PTE_W) != 0)
+    goto err;
+  if(mappages(kpagetable, VIRTIO0, PGSIZE, VIRTIO0, PTE_R | PTE_W) != 0)
+    goto err;
+  if(mappages(kpagetable, PLIC, 0x4000000, PLIC, PTE_R | PTE_W) != 0)
+    goto err;
+  if(mappages(kpagetable, KERNBASE, (uint64)etext - KERNBASE,
+              KERNBASE, PTE_R | PTE_X) != 0)
+    goto err;
+  if(mappages(kpagetable, (uint64)etext, PHYSTOP - (uint64)etext,
+              (uint64)etext, PTE_R | PTE_W) != 0)
+    goto err;
+  if(mappages(kpagetable, TRAMPOLINE, PGSIZE,
+              (uint64)trampoline, PTE_R | PTE_X) != 0)
+    goto err;
 
   return kpagetable;
+
+err:
+  proc_free_kpagetable(kpagetable);
+  return 0;
 }
+
+/*
+DEBUG : execout测试无法通过
+测试进程将内存吃满，然后还很鸡贼的逃开了我们的COW，它真的是每一页都写了一下
+然后就看你接下来进行的exec会不会 out of mem
+
+kvmmap建立映射的时候是调用mappages，在调用walk的时候会kalloc()
+注意kvmmap的函数的注释，明确指出了这里只是在系统初始的booting阶段调用去建立全局的初始内核页表的，
+并且一旦发生建立失败就会panic
+~~你看又急~~
+所以我们这里肯定是考虑分配失败后的情况，不能说一旦分配失败就err
+*/
+// pagetable_t
+// proc_kpagetable(void)
+// {
+//   pagetable_t kpagetable;
+
+//   kpagetable = (pagetable_t) kalloc();
+//   if(kpagetable == 0)
+//     return 0;
+//   memset(kpagetable, 0, PGSIZE);
+
+//   // device registers
+//   kvmmap(kpagetable, UART0, UART0, PGSIZE, PTE_R | PTE_W);
+//   kvmmap(kpagetable, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
+//   kvmmap(kpagetable, PLIC, PLIC, 0x4000000, PTE_R | PTE_W);
+
+//   // kernel text: executable and read-only
+//   kvmmap(kpagetable, KERNBASE, KERNBASE, (uint64)etext - KERNBASE, PTE_R | PTE_X);
+
+//   // kernel data and physical RAM
+//   kvmmap(kpagetable, (uint64)etext, (uint64)etext,
+//          PHYSTOP - (uint64)etext, PTE_R | PTE_W);
+
+//   // trampoline
+//   kvmmap(kpagetable, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+
+//   return kpagetable;
+// }
 
 void
 free_kpagetable_walk(pagetable_t pagetable)

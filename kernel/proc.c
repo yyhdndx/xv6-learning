@@ -541,7 +541,7 @@ scheduler(void)
         sfence_vma();
         swtch(&c->context, &p->context);
 
-        // switch bace to global kernel page table
+        // switch back to global kernel page table
         kvminithart();
 
         // Process is done running for now.

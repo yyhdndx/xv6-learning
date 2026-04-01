@@ -214,3 +214,7 @@ int thread_join(int tid){
 
     return 0;
 }
+
+int main(){
+    return 0;
+}

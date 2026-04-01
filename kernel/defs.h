@@ -203,5 +203,11 @@ void            virtio_disk_init(void);
 void            virtio_disk_rw(struct buf *, int);
 void            virtio_disk_intr(void);
 
+// e1000.c
+void e1000_init(volatile uint32 *base);
+void e1000_selftest(void);
+void e1000_receive(void);
+int e1000_transmit(char *buf,int len);
+
 // number of elements in fixed-size array
 #define NELEM(x) (sizeof(x)/sizeof((x)[0]))

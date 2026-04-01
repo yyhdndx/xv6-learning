@@ -105,6 +105,7 @@ extern uint64 sys_trace(void);
 extern uint64 sys_info(void);
 extern uint64 sys_sigalarm(void);
 extern uint64 sys_sigreturn(void);
+extern uint64 sys_e1000test(void);
 
 // An array mapping syscall numbers from syscall.h
 // to the function that handles the system call.
@@ -134,6 +135,7 @@ static uint64 (*syscalls[])(void) = {
 [SYS_info]    sys_info,
 [SYS_sigalarm]  sys_sigalarm,
 [SYS_sigreturn] sys_sigreturn,
+[SYS_e1000test] sys_e1000test,
 };
 
 static char *syscall_names[] = {
@@ -162,6 +164,7 @@ static char *syscall_names[] = {
   [SYS_info]  "info",
   [SYS_sigalarm]  "sigalarm",
   [SYS_sigreturn] "sigreturn",
+  [SYS_e1000test] "e1000test",
 };
 
 void

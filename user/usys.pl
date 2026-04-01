@@ -46,3 +46,4 @@ entry("trace");
 entry("info");
 entry("sigalarm");
 entry("sigreturn");
+entry("e1000test");
