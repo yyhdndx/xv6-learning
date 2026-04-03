@@ -30,7 +30,9 @@ OBJS = \
   $K/plic.o \
   $K/virtio_disk.o\
   $K/e1000.o\
-  $K/netstub.o\
+  $K/pci.o\
+  $K/net.o\
+  $K/sysnet.o\
 
 # riscv64-unknown-elf- or riscv64-linux-gnu-
 # perhaps in /opt/riscv/bin
@@ -168,7 +170,7 @@ UPROGS=\
 	$U/_alarmtest\
 	$U/_lazy\
 	$U/_uthread\
-	$U/_e1000test\
+	$U/_nettests\
 
 fs.img: mkfs/mkfs README $(UPROGS)
 	mkfs/mkfs fs.img README $(UPROGS)
@@ -197,7 +199,7 @@ QEMUOPTS = -machine virt -bios none -kernel $K/kernel -m 128M -smp $(CPUS) -nogr
 QEMUOPTS += -global virtio-mmio.force-legacy=false
 QEMUOPTS += -drive file=fs.img,if=none,format=raw,id=x0
 QEMUOPTS += -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
-QEMUOPTS += -netdev tap,id=net0,ifname=tap0,script=no,downscript=no
+QEMUOPTS += -netdev user,id=net0
 QEMUOPTS += -device e1000,netdev=net0
 QEMUOPTS += -object filter-dump,id=f1,netdev=net0,file=packets.pcap
 

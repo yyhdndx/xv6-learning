@@ -24,4 +24,4 @@
 #define SYS_info   23
 #define SYS_sigalarm    24
 #define SYS_sigreturn   25
-#define SYS_e1000test   26
+#define SYS_connect     26

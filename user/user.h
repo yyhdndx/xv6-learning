@@ -66,5 +66,4 @@ int thread_join(int tid);
 void thread_yield(void);
 int thread_self(void);
 
-// net 
-int e1000test();
+int connect(uint32, uint16, uint16);
