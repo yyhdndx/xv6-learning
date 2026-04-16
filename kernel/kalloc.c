@@ -12,36 +12,62 @@
 void freerange(void *pa_start, void *pa_end);
 
 extern char end[]; // first address after kernel.
-                   // defined by kernel.ld.
+// defined by kernel.ld.
 
 struct run {
   struct run *next;
 };
 
+/*
+Lab: lock
+- per-CPU freelist to reduce lock contention
+- steal pages from other CPUs when local freelist is empty
+
+Lab: cow
+- physical page reference count must be global, not per-CPU
+
+Lab: sysinfo/free_mem
+- count total free pages from all per-CPU freelists
+*/
+
+#define NPAGES ((PHYSTOP - KERNBASE) / PGSIZE)
+
 struct {
   struct spinlock lock;
   struct run *freelist;
-  int ref_cnt[(PHYSTOP-KERNBASE)/PGSIZE]; // lab5 COW
-  // 维护子进程页表对父进程页表的引用
-} kmem;
+} kmem[NCPU];
 
-void
-krefinit(void)
-{
-  for(int i = 0; i < (PHYSTOP-KERNBASE)/PGSIZE; i++)
-    kmem.ref_cnt[i] = 1; // 初始设成1的目的是让freerange中的kfree顺利-1
-}
+struct {
+  struct spinlock lock;
+  int cnt[NPAGES];
+} kref;
 
-int
+static inline int
 pa2index(uint64 pa)
 {
   return (pa - KERNBASE) / PGSIZE;
 }
 
 void
-kinit()
+krefinit(void)
 {
-  initlock(&kmem.lock, "kmem");
+  initlock(&kref.lock, "kref");
+  for(int i = 0; i < NPAGES; i++){
+    // initialize to 1 so that freerange()->kfree()
+    // will decrement to 0 and really put the page
+    // into freelist.
+    kref.cnt[i] = 1;
+  }
+}
+
+void
+kinit(void)
+{
+  for(int i = 0; i < NCPU; i++){
+    initlock(&kmem[i].lock, "kmem");
+    kmem[i].freelist = 0;
+  }
+
   krefinit();
   freerange(end, (void*)PHYSTOP);
 }
@@ -50,48 +76,98 @@ void
 freerange(void *pa_start, void *pa_end)
 {
   char *p;
+
   p = (char*)PGROUNDUP((uint64)pa_start);
   for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
     kfree(p);
 }
 
+// steal exactly one page from other CPU freelist.
+// returns 0 if no page can be stolen.
+// https://leetcode.cn/problems/delete-the-middle-node-of-a-linked-list
+static struct run*
+steal_from_other_cpu(int self)
+{
+  for(int i = 0; i < NCPU; i++){
+    if(i == self)
+      continue;
+
+    acquire(&kmem[i].lock);
+    if(kmem[i].freelist){
+      struct run *slow = kmem[i].freelist;
+      struct run *fast = kmem[i].freelist;
+      struct run *prev = 0;
+
+      while(fast && fast->next){
+        prev = slow;
+        slow = slow->next;
+        fast = fast->next->next;
+      }
+
+      // donate points to the second half
+      struct run *donate;
+      if(prev == 0){
+        // only one node
+        donate = kmem[i].freelist;
+        kmem[i].freelist = 0;
+      } else {
+        donate = slow;
+        prev->next = 0;
+      }
+
+      release(&kmem[i].lock);
+      return donate;
+    }
+    release(&kmem[i].lock);
+  }
+
+  return 0;
+}
+
 // Free the page of physical memory pointed at by pa,
 // which normally should have been returned by a
-// call to kalloc().  (The exception is when
+// call to kalloc(). (The exception is when
 // initializing the allocator; see kinit above.)
 void
 kfree(void *pa)
 {
   struct run *r;
+  int idx;
+  int id;
 
   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
 
-  r = (struct run*)pa;
+  idx = pa2index((uint64)pa);
 
-  // reduce the count of ref until ref_cnt turn into the 0
-  acquire(&kmem.lock);
-  int idx=pa2index((uint64)pa);
-  if(kmem.ref_cnt[idx]<=0){
+  // First handle the global reference count.
+  acquire(&kref.lock);
+  if(kref.cnt[idx] <= 0){
+    release(&kref.lock);
     panic("kfree ref");
   }
-  kmem.ref_cnt[idx]--;
-  if(kmem.ref_cnt[idx]>0){
-    // 仍然存在对这个页表有引用的进程，不能free，直接返回
-    release(&kmem.lock);
-    return ;
+
+  kref.cnt[idx]--;
+  if(kref.cnt[idx] > 0){
+    // still referenced by someone else
+    release(&kref.lock);
+    return;
   }
-  release(&kmem.lock);
-  
-  // Fill with junk to catch dangling refs.
+  release(&kref.lock);
+
+  // No references left: really free the page.
   memset(pa, 1, PGSIZE);
 
-  // put the free page to the front of the list 
-  // use lock to make sure atomic
-  acquire(&kmem.lock);
-  r->next = kmem.freelist;
-  kmem.freelist = r;
-  release(&kmem.lock);
+  r = (struct run*)pa;
+
+  // Put the page into current CPU's freelist.
+  push_off();
+  id = cpuid();
+  acquire(&kmem[id].lock);
+  r->next = kmem[id].freelist;
+  kmem[id].freelist = r;
+  release(&kmem[id].lock);
+  pop_off();
 }
 
 // Allocate one 4096-byte page of physical memory.
@@ -100,55 +176,109 @@ kfree(void *pa)
 void *
 kalloc(void)
 {
-  struct run *r;
+  struct run *r = 0;
+  struct run *donate = 0;
+  int id;
+  int idx;
 
-  // acquire the free page from the front of the freelist
-  acquire(&kmem.lock);
-  r = kmem.freelist;
-  if(r)
-    kmem.freelist = r->next;
+  push_off();
+  id = cpuid();
+  pop_off();
+
+  // fast path: try local freelist first
+  acquire(&kmem[id].lock);
+  if(kmem[id].freelist){
+    r = kmem[id].freelist;
+    kmem[id].freelist = r->next;
+    release(&kmem[id].lock);
+  } else {
+    // release self's lock before occupy other's lock in function steal_from_other_cpu()
+    // avoid hold and wait
+    // avoid deadlock ?
+    release(&kmem[id].lock);
+
+    // local empty, steal half from others
+    donate = steal_from_other_cpu(id);
+
+    acquire(&kmem[id].lock);
+    if(donate){
+      kmem[id].freelist = donate;
+      r = kmem[id].freelist;
+      kmem[id].freelist = r->next;
+    }
+    release(&kmem[id].lock);
+  }
 
   if(r){
-    kmem.ref_cnt[pa2index((uint64)r)]=1;
-  }
-  release(&kmem.lock);
+    idx = pa2index((uint64)r);
+    acquire(&kref.lock);
+    kref.cnt[idx] = 1;
+    release(&kref.lock);
 
-  if(r)
-    memset((char*)r, 5, PGSIZE); // fill with junk
+    memset((char*)r, 5, PGSIZE);
+    r->next = 0;
+  }
+
   return (void*)r;
 }
 
-uint64 free_mem(void){
-  acquire(&kmem.lock);
-  uint64 free_pages_count=0;
-  struct run* r=kmem.freelist;
-  while(r){
-    ++free_pages_count;
-    r=r->next;
+// lab2: count total free memory in all freelists.
+uint64
+free_mem(void)
+{
+  uint64 free_pages_count = 0;
+
+  for(int i = 0; i < NCPU; i++){
+    acquire(&kmem[i].lock);
+    struct run *cur = kmem[i].freelist;
+    while(cur){
+      free_pages_count++;
+      cur = cur->next;
+    }
+    release(&kmem[i].lock);
   }
-  release(&kmem.lock);
-  return free_pages_count*PGSIZE;
+
+  return free_pages_count * PGSIZE;
 }
 
-void kaddref(uint64 pa){
-  acquire(&kmem.lock);
-  kmem.ref_cnt[pa2index(pa)]++;
-  release(&kmem.lock);
+// lab cow: increase reference count of physical page pa.
+void
+kaddref(uint64 pa)
+{
+  int idx = pa2index(pa);
+
+  acquire(&kref.lock);
+  kref.cnt[idx]++;
+  release(&kref.lock);
 }
 
-void ksubref(uint64 pa){
-  acquire(&kmem.lock);
-  int idx=pa2index(pa);
-  if(kmem.ref_cnt[idx]<=0){
+// lab cow: decrease reference count of physical page pa.
+// usually kfree() is the preferred path for actual freeing;
+// this helper only adjusts the count.
+void
+ksubref(uint64 pa)
+{
+  int idx = pa2index(pa);
+
+  acquire(&kref.lock);
+  if(kref.cnt[idx] <= 0){
+    release(&kref.lock);
     panic("ksubref");
   }
-  kmem.ref_cnt[idx]--;
-  release(&kmem.lock);
+  kref.cnt[idx]--;
+  release(&kref.lock);
 }
 
-int kgetref(uint64 pa){
-  acquire(&kmem.lock);
-  int n=kmem.ref_cnt[pa2index(pa)];
-  release(&kmem.lock);
+// lab cow: get reference count of physical page pa.
+int
+kgetref(uint64 pa)
+{
+  int idx = pa2index(pa);
+  int n;
+
+  acquire(&kref.lock);
+  n = kref.cnt[idx];
+  release(&kref.lock);
+
   return n;
 }

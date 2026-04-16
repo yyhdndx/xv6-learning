@@ -23,32 +23,69 @@
 #include "fs.h"
 #include "buf.h"
 
-struct {
-  struct spinlock lock;
-  struct buf buf[NBUF];
+#define HASH(dev, blockno) (((dev) + (blockno)) % NBUCKET)
 
-  // Linked list of all buffers, through prev/next.
-  // Sorted by how recently the buffer was used.
-  // head.next is most recent, head.prev is least.
-  struct buf head;
+// 全局多个链表
+struct bucket {
+  struct spinlock lock;
+  struct buf head;  // 哨兵节点，挂这个桶里面的buf
+};
+
+struct {
+  struct buf buf[NBUF];
+  struct bucket buckets[NBUCKET];
 } bcache;
+
+// remove b from its current doubly-linked list.
+// caller must hold the corresponding bucket lock.
+static void
+buf_remove(struct buf *b)
+{
+  b->prev->next = b->next;
+  b->next->prev = b->prev;
+  b->next = 0;
+  b->prev = 0;
+}
+
+// insert b right after head in doubly-linked list.
+// caller must hold the corresponding bucket lock.
+static void
+buf_insert_head(struct buf *head, struct buf *b)
+{
+  b->next = head->next;
+  b->prev = head;
+  head->next->prev = b;
+  head->next = b;
+}
 
 void
 binit(void)
 {
   struct buf *b;
+  // init lock
+  for(int i=0;i<NBUCKET;i++){
+    initlock(&bcache.buckets[i].lock,"bache.bucket");
+    bcache.buckets[i].head.prev=&bcache.buckets[i].head;
+    bcache.buckets[i].head.next=&bcache.buckets[i].head;
+  }
+  // init all bufs and dispatch to buckets
+  for(int i=0;i<NBUF;i++){
+    b=&bcache.buf[i];
+    initsleeplock(&b->lock,"buffer");
 
-  initlock(&bcache.lock, "bcache");
+    b->valid=0;
+    b->disk=0;
+    b->dev=0;
+    b->blockno=0;
+    b->refcnt=0;
 
-  // Create linked list of buffers
-  bcache.head.prev = &bcache.head;
-  bcache.head.next = &bcache.head;
-  for(b = bcache.buf; b < bcache.buf+NBUF; b++){
-    b->next = bcache.head.next;
-    b->prev = &bcache.head;
-    initsleeplock(&b->lock, "buffer");
-    bcache.head.next->prev = b;
-    bcache.head.next = b;
+    int hash=i%NBUCKET;
+    // insert after bucket head
+    b->next=bcache.buckets[hash].head.next;
+    b->prev=&bcache.buckets[hash].head;
+    // 让哨兵节点的dummy head的next指向b
+    bcache.buckets[hash].head.next->prev=b; // b -> prev = b
+    bcache.buckets[hash].head.next=b;
   }
 }
 
@@ -59,33 +96,73 @@ static struct buf*
 bget(uint dev, uint blockno)
 {
   struct buf *b;
+  int h = HASH(dev, blockno);
 
-  acquire(&bcache.lock);
-
-  // Is the block already cached?
-  for(b = bcache.head.next; b != &bcache.head; b = b->next){
-    if(b->dev == dev && b->blockno == blockno){
-      b->refcnt++;
-      release(&bcache.lock);
-      acquiresleep(&b->lock);
-      return b;
+  while(1){
+    // 1) lookup only in target bucket
+    acquire(&bcache.buckets[h].lock);
+    for(b = bcache.buckets[h].head.next; b != &bcache.buckets[h].head; b = b->next){
+      if(b->dev == dev && b->blockno == blockno){
+        b->refcnt++;
+        release(&bcache.buckets[h].lock);
+        acquiresleep(&b->lock);
+        return b;
+      }
     }
-  }
+    release(&bcache.buckets[h].lock);
 
-  // Not cached.
-  // Recycle the least recently used (LRU) unused buffer.
-  for(b = bcache.head.prev; b != &bcache.head; b = b->prev){
-    if(b->refcnt == 0) {
-      b->dev = dev;
-      b->blockno = blockno;
-      b->valid = 0;
-      b->refcnt = 1;
-      release(&bcache.lock);
-      acquiresleep(&b->lock);
-      return b;
+    // 2) miss: scan buckets to steal one unused buf
+    struct buf *victim = 0;
+    int victim_bucket = -1;
+
+    for(int i = 0; i < NBUCKET; i++){
+      acquire(&bcache.buckets[i].lock);
+      for(b = bcache.buckets[i].head.next; b != &bcache.buckets[i].head; b = b->next){
+        if(b->refcnt == 0){
+          victim = b;
+          victim_bucket = i;
+          buf_remove(victim);
+          release(&bcache.buckets[i].lock);
+          goto found_victim;
+        }
+      }
+      release(&bcache.buckets[i].lock);
     }
+
+    panic("bget: no buffers");
+
+found_victim:
+    // check then add
+    // 系统可能会出现多条执行流，那么只要你在判断之后做操作了，其他的core就会借机插上，修改buf的状态，所以要recheck
+    // 3) re-check target bucket before inserting, to avoid duplicates
+    acquire(&bcache.buckets[h].lock);
+    for(b = bcache.buckets[h].head.next; b != &bcache.buckets[h].head; b = b->next){
+      if(b->dev == dev && b->blockno == blockno){
+        b->refcnt++;
+        release(&bcache.buckets[h].lock);
+
+        // someone else inserted it while we were stealing.
+        // put victim back to its original bucket.
+        acquire(&bcache.buckets[victim_bucket].lock);
+        buf_insert_head(&bcache.buckets[victim_bucket].head, victim);
+        release(&bcache.buckets[victim_bucket].lock);
+
+        acquiresleep(&b->lock);
+        return b;
+      }
+    }
+
+    // 4) install victim into target bucket
+    victim->dev = dev;
+    victim->blockno = blockno;
+    victim->valid = 0;
+    victim->refcnt = 1;
+    buf_insert_head(&bcache.buckets[h].head, victim);
+    release(&bcache.buckets[h].lock);
+
+    acquiresleep(&victim->lock);
+    return victim;
   }
-  panic("bget: no buffers");
 }
 
 // Return a locked buf with the contents of the indicated block.
@@ -116,38 +193,38 @@ bwrite(struct buf *b)
 void
 brelse(struct buf *b)
 {
+  int h;
+
   if(!holdingsleep(&b->lock))
     panic("brelse");
 
   releasesleep(&b->lock);
 
-  acquire(&bcache.lock);
+  h = HASH(b->dev, b->blockno);
+  acquire(&bcache.buckets[h].lock);
   b->refcnt--;
-  if (b->refcnt == 0) {
-    // no one is waiting for it.
-    b->next->prev = b->prev;
-    b->prev->next = b->next;
-    b->next = bcache.head.next;
-    b->prev = &bcache.head;
-    bcache.head.next->prev = b;
-    bcache.head.next = b;
-  }
-  
-  release(&bcache.lock);
+  if(b->refcnt < 0)
+    panic("brelse");
+  // no global LRU maintenance in this bucketed version
+  release(&bcache.buckets[h].lock);
 }
 
 void
 bpin(struct buf *b) {
-  acquire(&bcache.lock);
+  int h = HASH(b->dev, b->blockno);
+  acquire(&bcache.buckets[h].lock);
   b->refcnt++;
-  release(&bcache.lock);
+  release(&bcache.buckets[h].lock);
 }
 
 void
 bunpin(struct buf *b) {
-  acquire(&bcache.lock);
+  int h = HASH(b->dev, b->blockno);
+  acquire(&bcache.buckets[h].lock);
   b->refcnt--;
-  release(&bcache.lock);
+  if(b->refcnt<0)
+    panic("bunpin");
+  release(&bcache.buckets[h].lock);
 }
 
 
