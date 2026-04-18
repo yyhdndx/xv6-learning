@@ -72,6 +72,7 @@ install_trans(int recovering)
     if(recovering) {
       printf("recovering tail %d dst %d\n", tail, log.lh.block[tail]);
     }
+    // log block 里的内容，是目标 home block 最终应该被写成的那个新版本。
     struct buf *lbuf = bread(log.dev, log.start+tail+1); // read log block
     struct buf *dbuf = bread(log.dev, log.lh.block[tail]); // read dst
     memmove(dbuf->data, lbuf->data, BSIZE);  // copy block to dst
@@ -84,6 +85,8 @@ install_trans(int recovering)
 }
 
 // Read the log header from disk into the in-memory log header
+
+// read logheader block from disk and copy to log.lh
 static void
 read_head(void)
 {
@@ -176,6 +179,10 @@ end_op(void)
 }
 
 // Copy modified blocks from cache to log.
+
+// 仅在commit的时候出发，目的是将所有发生过修改的块全部写回磁盘
+// 所以这里调用了bwrite()
+// 其实也可以发现在commit的时候是先写回数据块后写回日志块
 static void
 write_log(void)
 {
@@ -185,7 +192,7 @@ write_log(void)
     struct buf *to = bread(log.dev, log.start+tail+1); // log block
     struct buf *from = bread(log.dev, log.lh.block[tail]); // cache block
     memmove(to->data, from->data, BSIZE);
-    bwrite(to);  // write the log
+    bwrite(to);  // write the log back to the disk
     brelse(from);
     brelse(to);
   }
@@ -196,6 +203,7 @@ commit()
 {
   if (log.lh.n > 0) {
     write_log();     // Write modified blocks from cache to log
+    // 真正发生commit的地方，将日志写入
     write_head();    // Write header to disk -- the real commit
     install_trans(0); // Now install writes to home locations
     log.lh.n = 0;
@@ -212,6 +220,9 @@ commit()
 //   modify bp->data[]
 //   log_write(bp)
 //   brelse(bp)
+
+// 将修改的block写入日志
+// log register
 void
 log_write(struct buf *b)
 {

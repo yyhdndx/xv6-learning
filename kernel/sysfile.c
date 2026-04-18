@@ -305,10 +305,12 @@ uint64
 sys_open(void)
 {
   char path[MAXPATH];
+  char target[MAXPATH];
   int fd, omode;
   struct file *f;
   struct inode *ip;
   int n;
+  int depth, len; // 递归文件的深度
 
   argint(1, &omode);
   if((n = argstr(0, path, MAXPATH)) < 0)
@@ -328,6 +330,46 @@ sys_open(void)
       return -1;
     }
     ilock(ip);
+
+    if((omode & O_NOFOLLOW) == 0){
+      // 套娃行为
+      // 万一symlink的指向的inode也是symlink，且形成环了不就完蛋了
+      // 所以要限制递归次数
+      for(depth = 0;depth < 10 && ip->type == T_SYMLINK;depth++){
+        len = ip->size;
+        if(len <= 0 || len >= MAXPATH){
+          iunlockput(ip);
+          end_op();
+          return -1;
+        }
+
+        // 读需要跳转到的inode
+        if(readi(ip, 0, (uint64)target, 0, len) != len){
+          iunlockput(ip);
+          end_op();
+          return -1;
+        }
+
+        target[len] = '\0'; // 防御式写法，因为我们在写入symlink的时候写入了'\0'
+
+        iunlockput(ip);
+
+        if((ip = namei(target)) == 0){
+          end_op();
+          return -1;
+        }
+        ilock(ip);
+      }
+
+      // 完蛋，还是symlink 
+      // panic QwQ
+      if(ip->type == T_SYMLINK){
+        iunlock(ip);
+        end_op();
+        return -1;
+      }
+    }
+
     if(ip->type == T_DIR && omode != O_RDONLY){
       iunlockput(ip);
       end_op();
@@ -340,6 +382,10 @@ sys_open(void)
     end_op();
     return -1;
   }
+
+  // 从内核的视角来看，确实找到inode就可以了
+  // 但是从user的视角看，文件时fd，不是inode
+  // 所以我们要进行转换成fd
 
   if((f = filealloc()) == 0 || (fd = fdalloc(f)) < 0){
     if(f)
@@ -524,4 +570,32 @@ sys_connect(void)
     return -1;
   }
   return fd;
+}
+
+uint64
+sys_symlink(void){
+  char target[MAXPATH], path[MAXPATH];
+  struct inode *ip;
+
+  argstr(0, target, MAXPATH);
+  argstr(1, path, MAXPATH);
+
+  begin_op();
+
+  ip = create(path, T_SYMLINK, 0, 0);
+  if(ip == 0){
+    end_op();
+    return -1;
+  }
+
+  // 将target的路径写入inode的数据区
+  if(writei(ip, 0, (uint64)target, 0, strlen(target) + 1) != strlen(target) +1){
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+
+  iunlockput(ip);
+  end_op();
+  return 0;
 }

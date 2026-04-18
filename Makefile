@@ -171,6 +171,7 @@ UPROGS=\
 	$U/_lazy\
 	$U/_uthread\
 	$U/_nettests\
+	$U/_symlinktest\
 
 fs.img: mkfs/mkfs README $(UPROGS)
 	mkfs/mkfs fs.img README $(UPROGS)

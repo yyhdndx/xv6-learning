@@ -47,3 +47,4 @@ entry("info");
 entry("sigalarm");
 entry("sigreturn");
 entry("connect");
+entry("symlink");

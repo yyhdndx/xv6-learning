@@ -67,3 +67,5 @@ void thread_yield(void);
 int thread_self(void);
 
 int connect(uint32, uint16, uint16);
+
+int symlink(const char *, const char *);

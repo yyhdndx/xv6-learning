@@ -346,8 +346,10 @@ iput(struct inode *ip)
     // so this acquiresleep() won't block (or deadlock).
     acquiresleep(&ip->lock);
 
+    // 不需要使用ip->ref了，释放，避免后面大规模的释放操作占用临界区
     release(&itable.lock);
 
+    // 释放缓存块并写回磁盘
     itrunc(ip);
     ip->type = 0;
     iupdate(ip);
@@ -370,6 +372,7 @@ iunlockput(struct inode *ip)
   iput(ip);
 }
 
+// 善后工作，在系统crash后回收inode
 void
 ireclaim(int dev)
 {
@@ -384,6 +387,8 @@ ireclaim(int dev)
     brelse(bp);
     if (ip) {
       begin_op();
+      // 确保这个 inode 的内容被从磁盘正确装入到内存中的 struct inode 里
+      // 所以这里做了先lock再unlock
       ilock(ip);
       iunlock(ip);
       iput(ip);
@@ -402,15 +407,21 @@ ireclaim(int dev)
 // Return the disk block address of the nth block in inode ip.
 // If there is no such block, bmap allocates one.
 // returns 0 if out of disk space.
+
+// bn表示文件的逻辑块，表示偏移量
 static uint
 bmap(struct inode *ip, uint bn)
 {
   uint addr, *a;
   struct buf *bp;
 
+  // 如果小于NDIRECT，直接走直接块，否则走一级间接块
+  // 如果还不行就panic
+  // xv6是没有二级和三级的
+  // direct
   if(bn < NDIRECT){
     if((addr = ip->addrs[bn]) == 0){
-      addr = balloc(ip->dev);
+      addr = balloc(ip->dev); // 返回物理块号
       if(addr == 0)
         return 0;
       ip->addrs[bn] = addr;
@@ -419,15 +430,19 @@ bmap(struct inode *ip, uint bn)
   }
   bn -= NDIRECT;
 
+  // single indirect
   if(bn < NINDIRECT){
     // Load indirect block, allocating if necessary.
+    // 建立inode -> indirect block 的关系
+    // 但是还没有建立indirect block -> data block 的映射
     if((addr = ip->addrs[NDIRECT]) == 0){
       addr = balloc(ip->dev);
       if(addr == 0)
         return 0;
       ip->addrs[NDIRECT] = addr;
     }
-    bp = bread(ip->dev, addr);
+    // 在这里建立 bn -> data block的映射关系
+    bp = bread(ip->dev, addr);  // 把间接块读的buf读出来
     a = (uint*)bp->data;
     if((addr = a[bn]) == 0){
       addr = balloc(ip->dev);
@@ -440,18 +455,79 @@ bmap(struct inode *ip, uint bn)
     return addr;
   }
 
+  // double indirect
+  bn -= NINDIRECT;
+
+  if(bn < NDINDIRECT){
+    uint first = bn / NINDIRECT;  // 位于第几个一级缓存块
+    uint second = bn % NINDIRECT; // 位于第几个block
+
+    uint indir_addr, data_addr;
+    struct buf *bp1, *bp2;
+    uint *a1, *a2;
+
+    // 分配二级索引块
+    if((addr = ip -> addrs[NDIRECT + 1]) == 0){
+      addr = balloc(ip->dev);
+      if(addr == 0) return 0;
+      ip -> addrs[NDIRECT + 1] = addr;
+    }
+
+    // 读出二级索引块
+    bp1 = bread(ip->dev, addr);
+    a1 = (uint*)bp1->data;
+
+    // 分配指向的一级索引块
+    if((indir_addr = a1[first]) == 0){
+      indir_addr = balloc(ip->dev);
+      if(indir_addr == 0){
+        brelse(bp1);
+        return 0;
+      }
+      a1[first] = indir_addr;
+      log_write(bp1);
+    }
+    brelse(bp1);
+
+    // 读取一级索引块
+    bp2 = bread(ip->dev, indir_addr);
+    a2 = (uint*) bp2->data;
+
+    // 分配数据块
+    if((data_addr = a2[second]) == 0){
+      data_addr = balloc(ip->dev);
+      if(data_addr){
+        a2[second] = data_addr;
+        log_write(bp2);
+      }
+    }
+    brelse(bp2);
+    return data_addr;
+  }
+
   panic("bmap: out of range");
 }
 
 // Truncate inode (discard contents).
 // Caller must hold ip->lock.
+
+// bmap() 的逆操作
+// 将对应位置的block进行释放
+// 被iput调用清理inode
+
+// 先释放直接块
+// 后释放间接块指向的数据块
+// 后释放间接块本身
+// 再将inode写回磁盘
+
 void
 itrunc(struct inode *ip)
 {
-  int i, j;
-  struct buf *bp;
-  uint *a;
+  int i, j, k;
+  struct buf *bp, *bp2;
+  uint *a, *a2;
 
+  // 1) free direct blocks
   for(i = 0; i < NDIRECT; i++){
     if(ip->addrs[i]){
       bfree(ip->dev, ip->addrs[i]);
@@ -459,6 +535,7 @@ itrunc(struct inode *ip)
     }
   }
 
+  // 2) free single indirect blocks
   if(ip->addrs[NDIRECT]){
     bp = bread(ip->dev, ip->addrs[NDIRECT]);
     a = (uint*)bp->data;
@@ -469,6 +546,31 @@ itrunc(struct inode *ip)
     brelse(bp);
     bfree(ip->dev, ip->addrs[NDIRECT]);
     ip->addrs[NDIRECT] = 0;
+  }
+
+  // 3) free double indirect blocks
+  if(ip->addrs[NDIRECT + 1]){
+    bp = bread(ip->dev, ip->addrs[NDIRECT + 1]);
+    a = (uint*)bp->data;
+
+    for(i = 0; i < NINDIRECT; i++){
+      if(a[i]){
+        bp2 = bread(ip->dev, a[i]);
+        a2 = (uint*)bp2->data;
+
+        for(k = 0; k < NINDIRECT; k++){
+          if(a2[k])
+            bfree(ip->dev, a2[k]);
+        }
+
+        brelse(bp2);
+        bfree(ip->dev, a[i]);   // free that single-indirect block
+      }
+    }
+
+    brelse(bp);
+    bfree(ip->dev, ip->addrs[NDIRECT + 1]); // free double-indirect root block
+    ip->addrs[NDIRECT + 1] = 0;
   }
 
   ip->size = 0;
@@ -491,6 +593,7 @@ stati(struct inode *ip, struct stat *st)
 // Caller must hold ip->lock.
 // If user_dst==1, then dst is a user virtual address;
 // otherwise, dst is a kernel address.
+// 从给定的off偏移开始读，读n个字节
 int
 readi(struct inode *ip, int user_dst, uint64 dst, uint off, uint n)
 {
@@ -503,11 +606,13 @@ readi(struct inode *ip, int user_dst, uint64 dst, uint off, uint n)
     n = ip->size - off;
 
   for(tot=0; tot<n; tot+=m, off+=m, dst+=m){
+    // 先通过当前的offset找目前的block
     uint addr = bmap(ip, off/BSIZE);
     if(addr == 0)
       break;
     bp = bread(ip->dev, addr);
     m = min(n - tot, BSIZE - off%BSIZE);
+    // 从buf拷贝到目标地址
     if(either_copyout(user_dst, dst, bp->data + (off % BSIZE), m) == -1) {
       brelse(bp);
       tot = -1;
@@ -546,16 +651,19 @@ writei(struct inode *ip, int user_src, uint64 src, uint off, uint n)
       brelse(bp);
       break;
     }
+    // write操作要修改日志
     log_write(bp);
     brelse(bp);
   }
 
+  // 修改文件大小
   if(off > ip->size)
     ip->size = off;
 
   // write the i-node back to disk even if the size didn't change
   // because the loop above might have called bmap() and added a new
   // block to ip->addrs[].
+  // 数组元信息发生了修改，还是需要给inode标记为修改
   iupdate(ip);
 
   return tot;
