@@ -111,6 +111,7 @@ void            yield(void);
 int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
 int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
 void            procdump(void);
+int             vmaunmap(struct proc *p, uint64 addr, uint64 length, int do_free);
 // lab2 count current proc
 uint64          nproc(void);
 
@@ -193,6 +194,9 @@ int             kvm_page_matches(pagetable_t kpgtbl, uint64 va, uint64 pa, uint6
 // lab 5 copy on write
 int             cowalloc(pagetable_t pagetable,uint64 va);
 int             cowpage(pagetable_t pagetable,uint64 va);
+// lab mmap
+int             mmapfault(struct proc *p, uint64 va);
+struct vma*     findvma(struct proc *p, uint64 va);
 
 // plic.c
 void            plicinit(void);

@@ -5,6 +5,7 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "fcntl.h"
 
 struct spinlock tickslock;
 uint ticks;
@@ -61,8 +62,17 @@ usertrap(void)
     uint64 va = r_stval();
     uint64 stackbase = PGROUNDDOWN(p->trapframe->sp);
     pte_t* pte;
+    struct vma *v = findvma(p, va);
 
-    if(va >= p->sz || va >= PLIC){
+    if(v != 0){
+      if((v->prot & PROT_WRITE) == 0){
+        // printf("mmap 15 : setkill\n");
+        setkilled(p);
+      } else if(mmapfault(p, va) < 0){
+        // printf("mmap 15 : setkill\n");
+        setkilled(p);
+      }
+    }else if(va >= p->sz || va >= PLIC){
       setkilled(p);
     } else if(stackbase >= PGSIZE &&
               va >= stackbase - PGSIZE &&
@@ -90,8 +100,15 @@ usertrap(void)
   } else if(r_scause() == 13){   // load page fault
     uint64 va = r_stval();
     uint64 stackbase = PGROUNDDOWN(p->trapframe->sp);
+    struct vma *v = findvma(p, va);
 
-    if(va >= p->sz || va >= PLIC){
+    // check mmap
+    if(v!=0){
+      if(mmapfault(p, va)<0){
+        // printf("mmap 13 : setkill\n");
+        setkilled(p);
+      }
+    } else if(va >= p->sz || va >= PLIC){
       setkilled(p);
     } else if(stackbase >= PGSIZE &&
               va >= stackbase - PGSIZE &&
@@ -99,6 +116,19 @@ usertrap(void)
       setkilled(p);
     } else if(vmfault(p->pagetable, va, 1) == 0){
       setkilled(p);
+    }
+  } else if(r_scause() == 12){   // instruction page fault
+    uint64 va = r_stval();
+    struct vma *v = findvma(p, va);
+    if(v != 0){
+      if((v->prot & PROT_EXEC) == 0){
+        // printf("mmap 12 : setkill\n");
+        setkilled(p);
+      }
+      else if(mmapfault(p, va) < 0){
+        // printf("mmap 12 : setkill\n");
+        setkilled(p);
+      }
     }
   } else {
     printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);

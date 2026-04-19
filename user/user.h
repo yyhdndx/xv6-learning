@@ -25,6 +25,9 @@ int getpid(void);
 char* sys_sbrk(int,int);
 int pause(int);
 int uptime(void);
+int symlink(const char *, const char *);
+void* mmap(void *addr, int length, int prot, int flags, int fd, int offset);
+int munmap(void *addr, int length);
 
 // ulib.c
 int stat(const char*, struct stat*);
@@ -67,5 +70,3 @@ void thread_yield(void);
 int thread_self(void);
 
 int connect(uint32, uint16, uint16);
-
-int symlink(const char *, const char *);

@@ -1,10 +1,14 @@
 #include "types.h"
 #include "param.h"
+#include "fcntl.h"
 #include "memlayout.h"
 #include "riscv.h"
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "sleeplock.h"
+#include "fs.h"
+#include "file.h"
 
 struct cpu cpus[NCPU];
 
@@ -179,6 +183,12 @@ found:
   p->alarm_active=0;
   memset(&p->alarm_tf,0,sizeof(p->alarm_tf));
 
+  // lab mmap
+  p->mmapbase = MMAPTOP;   // mmap regions grow downward
+  for(int i = 0; i < NVMA; i++){
+    p->vmas[i].used = 0;
+  }
+
   return p;
 }
 
@@ -206,6 +216,11 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+  p->mmapbase = 0;
+  for(int i = 0; i < NVMA; i++){
+    p->vmas[i].used = 0;
+    p->vmas[i].f = 0;
+  }
 }
 
 // Create a user page table for a given process, with no user memory,
@@ -347,7 +362,7 @@ kfork(void)
     return -1;
   }
 
-  // Copy user memory from parent to child.
+  // 1. copy normal user memory [0, sz)
   if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
     freeproc(np);
     release(&np->lock);
@@ -355,15 +370,72 @@ kfork(void)
   }
   np->sz = p->sz;
 
-  // already has alloc the kernel page table 
-  // only has to map to the user kpage table
-  if(kvmmap_user(np->kpagetable,np->pagetable,np->sz)<0){
+  // 2. copy mmap metadata
+  np->mmapbase = p->mmapbase;
+  for(i = 0; i < NVMA; i++){
+    if(p->vmas[i].used){
+      np->vmas[i] = p->vmas[i];
+      filedup(np->vmas[i].f);
+    } else {
+      np->vmas[i].used = 0;
+    }
+  }
+
+  // 3. mirror normal [0, sz) user pages into child's kernel page table
+  if(kvmmap_user(np->kpagetable, np->pagetable, np->sz) < 0){
+    for(i = 0; i < NVMA; i++){
+      if(np->vmas[i].used && np->vmas[i].f)
+        fileclose(np->vmas[i].f);
+      np->vmas[i].used = 0;
+    }
     freeproc(np);
     release(&np->lock);
     return -1;
   }
 
-  // copy saved user registers.
+  // 4. copy already-faulted mmap pages
+  for(i = 0; i < NVMA; i++){
+    if(!p->vmas[i].used)
+      continue;
+
+    uint64 start = PGROUNDDOWN(p->vmas[i].addr);
+    uint64 end   = PGROUNDUP(p->vmas[i].addr + p->vmas[i].length);
+
+    for(uint64 va = start; va < end; va += PGSIZE){
+      pte_t *pte = walk(p->pagetable, va, 0);
+
+      // lazy mmap page not populated yet in parent => skip
+      if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0)
+        continue;
+
+      // must be a leaf mapping
+      if(PTE_FLAGS(*pte) == PTE_V)
+        continue;
+
+      uint64 pa = PTE2PA(*pte);
+      uint flags = PTE_FLAGS(*pte);
+
+      char *mem = kalloc();
+      if(mem == 0)
+        goto bad;
+
+      memmove(mem, (char*)pa, PGSIZE);
+
+      if(mappages(np->pagetable, va, PGSIZE, (uint64)mem, flags) != 0){
+        kfree(mem);
+        goto bad;
+      }
+
+      // mirror this mmap page into child's kpagetable too
+      if(mappages(np->kpagetable, va, PGSIZE, (uint64)mem, flags & (~PTE_U)) != 0){
+        uvmunmap(np->pagetable, va, 1, 1);
+        uvmunmap(np->kpagetable, va, 1, 0);
+        goto bad;
+      }
+    }
+  }
+
+  // 5. copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
 
   // Cause fork to return 0 in the child.
@@ -380,7 +452,7 @@ kfork(void)
   pid = np->pid;
 
   // lab 2
-  np->trace_mask=p->trace_mask;
+  np->trace_mask = p->trace_mask;
 
   release(&np->lock);
 
@@ -393,6 +465,18 @@ kfork(void)
   release(&np->lock);
 
   return pid;
+
+bad:
+  // close mmap file refs copied above
+  for(i = 0; i < NVMA; i++){
+    if(np->vmas[i].used && np->vmas[i].f)
+      fileclose(np->vmas[i].f);
+    np->vmas[i].used = 0;
+  }
+
+  freeproc(np);
+  release(&np->lock);
+  return -1;
 }
 
 // Pass p's abandoned children to init.
@@ -408,6 +492,90 @@ reparent(struct proc *p)
       wakeup(initproc);
     }
   }
+}
+
+// unmap all of the VMA in proc
+// when unmaping, write the current content back to disk
+int
+vmaunmap(struct proc *p, uint64 addr, uint64 length, int do_free)
+{
+  struct vma *v = 0;
+
+  // find which VMA
+  for(int i = 0; i < NVMA; i++){
+    if(p->vmas[i].used &&
+       addr >= p->vmas[i].addr &&
+       addr < p->vmas[i].addr + p->vmas[i].length){
+      v = &p->vmas[i];
+      break;
+    }
+  }
+  if(v == 0)
+    return -1;
+
+  uint64 end = addr + length;
+  uint64 vend = v->addr + v->length;
+  if(end > vend)
+    return -1;
+
+  // lab only requires unmap from beginning, end, or all
+  if(addr != v->addr && end != vend)
+    return -1;
+
+  // write back if MAP_SHARED
+  if((v->flags & MAP_SHARED) && v->f->writable){
+    begin_op();
+    ilock(v->f->ip);
+    /*
+    用户态的虚拟地址 addr
+    它相对的相对偏移量就是addr - v->addr
+    而映射是从文件的 v-> offset开始的
+    */
+    uint64 off = v->offset + (addr - v->addr);
+    uint64 remain = length;
+    uint64 cur = addr;
+    // 每次最多删除一页
+    while(remain > 0){
+      uint64 n = remain > PGSIZE ? PGSIZE : remain;
+      if(writei(v->f->ip, 1, cur, off, n) != n){
+        // ignore in lab
+      }
+      cur += n;
+      off += n;
+      remain -= n;
+    }
+
+    iunlock(v->f->ip);
+    end_op();
+  }
+
+  // 再删除页表
+  uint64 a = PGROUNDDOWN(addr);
+  uint64 last = PGROUNDUP(addr + length);
+  uint64 npages = (last - a) / PGSIZE;
+
+  if(last > a){
+    uvmunmap(p->pagetable, a, npages, do_free);
+    uvmunmap(p->kpagetable, a, npages, 0);
+  }
+
+  // 分三种情况
+  // 全删，删开头，删结尾
+  if(addr == v->addr && length == v->length){
+    fileclose(v->f);
+    v->used = 0;
+  } else if(addr == v->addr){
+    v->addr += length;
+    v->offset += length;
+    v->length -= length;
+  } else if(end == vend){
+    v->length -= length;
+  } else {
+    // lab guarantees no hole punching in middle
+    return -1;
+  }
+
+  return 0;
 }
 
 // Exit the current process.  Does not return.
@@ -427,6 +595,12 @@ kexit(int status)
       struct file *f = p->ofile[fd];
       fileclose(f);
       p->ofile[fd] = 0;
+    }
+  }
+
+  for(int i = 0; i < NVMA; i++){
+    if(p->vmas[i].used){
+      vmaunmap(p, p->vmas[i].addr, p->vmas[i].length, 1);
     }
   }
 

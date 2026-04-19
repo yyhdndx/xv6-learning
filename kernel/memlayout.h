@@ -60,3 +60,5 @@
 
 // e1000 intr
 #define E1000_IRQ 33
+
+#define MMAPTOP (PLIC - 2*PGSIZE)

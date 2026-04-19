@@ -172,6 +172,7 @@ UPROGS=\
 	$U/_uthread\
 	$U/_nettests\
 	$U/_symlinktest\
+	$U/_mmaptest\
 
 fs.img: mkfs/mkfs README $(UPROGS)
 	mkfs/mkfs fs.img README $(UPROGS)

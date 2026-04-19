@@ -599,3 +599,73 @@ sys_symlink(void){
   end_op();
   return 0;
 }
+
+uint64
+sys_mmap(void){
+  uint64 addr, length, offset;
+  int prot, flags, fd;
+  struct file *f;
+  struct proc *p = myproc();
+
+  argaddr(0, &addr);
+  argaddr(1, &length);
+  argint(2, &prot);
+  argint(3, &flags);
+  argfd(4, &fd, &f);
+  argaddr(5, &offset);
+
+  if(addr != 0)
+    return -1;
+  if(length == 0)
+    return -1;
+  if(offset != 0)
+    return -1;
+
+  if((prot & PROT_READ) && !f->readable)
+    return -1;
+  if((flags & MAP_SHARED) && (prot & PROT_WRITE) && !f->writable)
+    return -1;
+
+  int idx = -1;
+  for(int i=0;i<NVMA;i++){
+    if(!p->vmas[i].used){
+      idx=i;
+      break;
+    }
+  }
+
+  if(idx<0) return idx;
+
+  uint64 len=PGROUNDUP(length);
+  uint64 base=PGROUNDDOWN(p->mmapbase - len);
+  // mmap是放在高地址向下生长的，所以不能小于proc本身的地址
+  if(base<p->sz){
+    return -1;
+  }
+
+  p->mmapbase=base;
+
+  p->vmas[idx].used = 1;
+  p->vmas[idx].addr = base;
+  p->vmas[idx].length = length;   // keep original byte length
+  p->vmas[idx].prot = prot;
+  p->vmas[idx].flags = flags;
+  p->vmas[idx].offset = offset;
+  p->vmas[idx].f = filedup(f);
+
+  return base;
+}
+
+uint64
+sys_munmap(void)
+{
+  uint64 addr, length;
+
+  argaddr(0, &addr);
+  argaddr(1, &length);
+
+  if(length == 0)
+    return -1;
+
+  return vmaunmap(myproc(), addr, length, 1);
+}

@@ -81,6 +81,16 @@ struct trapframe {
 
 enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
 
+struct vma {
+  int used;
+  uint64 addr;      // start virtual address
+  uint64 length;    // bytes
+  int prot;
+  int flags;
+  uint64 offset;
+  struct file *f;
+};
+
 // Per-process state
 struct proc {
   struct spinlock lock;
@@ -116,4 +126,7 @@ struct proc {
   uint64 alarm_handler;       // handler 的用户地址
   int alarm_active;           // 当前是否正在执行 handler，防止重入
   struct trapframe alarm_tf;  // 被打断前保存的一份 trapframe
+
+  struct vma vmas[NVMA];
+  uint64 mmapbase;   // allocate mmap area downward from high address
 };

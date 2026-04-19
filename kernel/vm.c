@@ -7,6 +7,9 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "fs.h"
+#include "sleeplock.h"
+#include "file.h"
+#include "fcntl.h"
 
 /*
  * the kernel's page table.
@@ -207,6 +210,7 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
   for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
     if((pte = walk(pagetable, a, 0)) == 0) // leaf page table entry allocated?
       continue;   
+    // 注意可能回遇到lazy alloc的情况，所以不是所有页面都是需要free的
     if((*pte & PTE_V) == 0)  // has physical page been allocated?
       continue;
     if(do_free){
@@ -971,4 +975,98 @@ int cowalloc(pagetable_t pagetable,uint64 va){
   return 0;
 }
 
+struct vma*
+findvma(struct proc *p, uint64 va)
+{
+  for(int i = 0; i < NVMA; i++){
+    if(p->vmas[i].used &&
+       va >= p->vmas[i].addr &&
+       va < p->vmas[i].addr + p->vmas[i].length){
+      return &p->vmas[i];
+    }
+  }
+  return 0;
+}
 
+// 和vmfault做的事情差不太多
+// 
+int
+mmapfault(struct proc *p, uint64 va)
+{
+  struct vma *v;
+  uint64 va0;
+  uint64 off;
+  char *mem;
+  int perm;
+  pte_t *upte, *kpte;
+
+  v = findvma(p, va);
+  if(v == 0)
+    return -1;
+
+  va0 = PGROUNDDOWN(va);
+  // printf("mmapfault: va=%lx va0=%lx\n", va, va0);
+
+  upte = walk(p->pagetable, va0, 0);
+  kpte = walk(p->kpagetable, va0, 0);
+
+  if(upte && (*upte & PTE_V)){
+    // pagetable 已有映射，尽量修复 kpagetable
+    uint64 pa = PTE2PA(*upte);
+    uint64 flags = PTE_FLAGS(*upte);
+    if(kvmremap_user_range(p->kpagetable, va0, pa, flags) != 0)
+      return -1;
+    return 0;
+  }
+
+  if(kpte && (*kpte & PTE_V)){
+    // kpagetable 脏了，但 pagetable 没有；先清掉旧镜像再继续
+    ukvmunmap(p->kpagetable, va0, 1);
+  }
+
+  // printf("  before map: upte=%p", upte);
+  // if(upte) printf(" *upte=%lx", *upte);
+  // printf("  kpte=%p", kpte);
+  // if(kpte) printf(" *kpte=%lx", *kpte);
+  // printf("\n");
+
+  if(upte && (*upte & PTE_V))
+    return 0;
+
+  mem = kalloc();
+  if(mem == 0)
+    return -1;
+  memset(mem, 0, PGSIZE);
+
+  off = v->offset + (va0 - v->addr);
+
+  begin_op();
+  ilock(v->f->ip);
+  readi(v->f->ip, 0, (uint64)mem, off, PGSIZE);
+  iunlock(v->f->ip);
+  end_op();
+
+  perm = PTE_U;
+  if(v->prot & PROT_READ)
+    perm |= PTE_R;
+  if(v->prot & PROT_WRITE)
+    perm |= PTE_R | PTE_W;
+  if(v->prot & PROT_EXEC)
+    perm |= PTE_X;
+
+  // printf("  map user va0=%lx pa=%lx perm=%x\n", va0, (uint64)mem, perm);
+  if(mappages(p->pagetable, va0, PGSIZE, (uint64)mem, perm) != 0){
+    // printf("  user mappages failed\n");
+    kfree(mem);
+    return -1;
+  }
+
+  // printf("  map kernel va0=%lx pa=%lx perm=%lx\n", va0, (uint64)mem, perm & (~PTE_U));
+  if(mappages(p->kpagetable, va0, PGSIZE, (uint64)mem, perm & (~PTE_U)) != 0){
+    // printf("  kernel mappages failed\n");
+    uvmunmap(p->pagetable, va0, 1, 1);
+    return -1;
+  }
+
+  return 0;
+}
